@@ -1,477 +1,607 @@
-"""Small Telegram Imposter game bot. Python 3.10+, no dependencies."""
+"""Telegram Imposter. Python 3.10+, standard library only."""
+import argparse
 import json
 import logging
 import os
-import random
-import secrets
 import time
-from pathlib import Path
-from urllib import request, error
+from urllib import error, request
 
-TOKEN = os.environ.get("BOT_TOKEN", "")
-API = f"https://api.telegram.org/bot{TOKEN}/"
-USERNAME = ""
-STATE = Path(os.environ.get("STATE_FILE", "data/state.json"))
-games = {}  # group_id -> {admin, players, stage, count, word, message_id}
-pending = {}  # admin_id -> group_id
-offset = None
+import game
+import ui
+from storage import Store
 
 
-def save():
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    temp = STATE.with_suffix(".tmp")
-    temp.write_text(json.dumps({"games": games, "pending": pending, "offset": offset}, default=list), encoding="utf-8")
-    for attempt in range(5):
+class ApiError(RuntimeError):
+    def __init__(self, message, code=0, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
+
+
+class Telegram:
+    def __init__(self, token):
+        self.base = f'https://api.telegram.org/bot{token}/'
+        self.last_call = 0
+
+    def call(self, method, **params):
+        if method != 'getUpdates':
+            time.sleep(max(0, 0.045 - (time.monotonic() - self.last_call)))
+        req = request.Request(self.base + method, data=json.dumps(params).encode(),
+                              headers={'Content-Type': 'application/json'})
         try:
-            os.replace(temp, STATE)
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.1)
+            with request.urlopen(req, timeout=20) as response:
+                result = json.load(response)
+        except error.HTTPError as exc:
+            try:
+                result = json.loads(exc.read())
+            except (ValueError, OSError):
+                raise ApiError('Telegram HTTP error', exc.code) from None
+            raise ApiError(result.get('description', 'Telegram error'), exc.code,
+                           result.get('parameters', {}).get('retry_after', 0)) from None
+        except (error.URLError, TimeoutError, OSError):
+            raise ApiError('Telegram недоступен по сети. Повторим позже.') from None
+        finally:
+            self.last_call = time.monotonic()
+        if not result.get('ok'):
+            raise ApiError(result.get('description', 'Telegram error'))
+        return result['result']
 
 
-def load():
-    global games, pending, offset
-    if not STATE.exists():
-        return
-    data = json.loads(STATE.read_text(encoding="utf-8"))
-    games = {int(k): v for k, v in data["games"].items()}
-    pending = {int(k): v for k, v in data["pending"].items()}
-    offset = data["offset"]
-    for game in games.values():
-        # Previous releases used 'done' for roles dealt, before results existed.
-        if game['stage'] == 'done':
-            game['stage'] = 'playing'
-        game["players"] = {int(k): v for k, v in game["players"].items()}
-        for key in ("imposters", "delivered"):
-            if key in game:
-                game[key] = set(game[key])
+class Bot:
+    def __init__(self, store, api, username, clock=time.time):
+        self.store, self.api, self.username, self.clock = store, api, username, clock
+        self.dirty = set(store.games)
+        self.cache = {}
+        self.last_edit = {}
+        self.cooldown = {}
+        self.global_cooldown = 0
+        self.last_timer = -1
 
+    def save(self):
+        self.store.save()
 
-def api(method, **params):
-    body = json.dumps(params).encode()
-    req = request.Request(API + method, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with request.urlopen(req, timeout=40) as response:
-            result = json.load(response)
-    except error.HTTPError as exc:
-        result = json.loads(exc.read())
-        raise RuntimeError(f"Telegram {exc.code}: {result.get('description', 'API error')}") from None
-    except (error.URLError, TimeoutError, OSError):
-        raise RuntimeError("Telegram network error") from None
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", method))
-    return result["result"]
+    def touch(self, gid):
+        self.dirty.add(gid)
+        self.save()
 
-
-def send(chat_id, text, **kwargs):
-    return api("sendMessage", chat_id=chat_id, text=text, **kwargs)
-
-
-def name(user):
-    return user.get("first_name") or user.get("username") or str(user["id"])
-
-
-def lobby_text(game):
-    players = list(game["players"].values())
-    stage = game['stage']
-    status = {'count': '⚙️ Ведущий выбирает число импостеров', 'word': '✍️ Ведущий задаёт слово', 'ready': '🟢 Лобби открыто — ждём игроков', 'playing': '🎮 Игра идёт — обсуждайте ассоциации', 'finished': '🏁 Игра завершена', 'cancelled': 'Игра отменена'}.get(stage, 'Игра')
-    if 'imposters' in game and stage == 'ready':
-        status = '📨 Раздача ролей — вход закрыт'
-    roster = '\n'.join(f"{i}. {name(p)[:45]}" for i, p in enumerate(players, 1)) or 'Пока никого — нажми «Участвую»!'
-    count = game.get('count')
-    details = f"\nИмпостеров: {count}" if count else ''
-    if 'imposters' in game:
-        details += f"\nРоли доставлены: {len(game.get('delivered', []))}/{len(players)}"
-    elif count:
-        details += f"\nДо минимального состава: {max(0, count + 1 - len(players))}"
-    result = ''
-    if stage == 'finished':
-        imposters = ', '.join(name(p)[:45] for p in players if p['id'] in game.get('imposters', set()))
-        result = f"\n\n🔓 Слово: {game['word']}\n🎭 Импостеры: {imposters}"
-    return f"🎭 ИМПОСТЕР — ТАБЛО\nВедущий: {game.get('host_name', 'создатель игры')}\n{status}{details}\n\nИгроки ({len(players)}):\n{roster}{result}"
-
-
-def keyboard(game):
-    n = game['nonce']
-    status_row = [{"text": "🔄 Обновить статус", "callback_data": f"status:{n}"}]
-    if game['stage'] in ('finished', 'cancelled'):
-        return {"inline_keyboard": [[{"text": "🎲 Следующая игра", "callback_data": "newgame"}], status_row]}
-    if game['stage'] == 'playing':
-        return {"inline_keyboard": [status_row, [{"text": "🏁 Завершить и показать результат", "callback_data": f"finish:{n}"}]]}
-    if 'imposters' in game:
-        return controls(game)
-    rows = [[{"text": "🎮 Участвую", "url": f"https://t.me/{USERNAME}?start=join_{n}"}], [{"text": "⚙️ Настроить игру", "url": f"https://t.me/{USERNAME}?start=setup_{n}"}]]
-    if game['stage'] == 'ready':
-        rows.append([{"text": "🚀 Раздать роли", "callback_data": f"begin:{n}"}])
-    rows.append([{"text": "Выйти из игры", "callback_data": f"leave:{n}"}, {"text": "Отменить игру", "callback_data": f"stop:{n}"}])
-    rows.append(status_row)
-    return {"inline_keyboard": rows}
-
-
-def menu(cid):
-    send(cid, "🎭 Импостер — игра в ассоциации.\n\nЛюбой участник может создать игру и стать ведущим. Он задаёт слово в личке; остальные получают слово или роль импостера.\n\nНажми кнопку, чтобы начать.", reply_markup={"inline_keyboard": [[{"text": "🎲 Новая игра", "callback_data": "newgame"}]]})
-
-
-def controls(game):
-    return {"inline_keyboard": [[{"text": "🚀 Раздать роли", "callback_data": f"begin:{game['nonce']}"}], [{"text": "Отменить игру", "callback_data": f"stop:{game['nonce']}"}]]}
-
-
-def host_keyboard(game):
-    n = game['nonce']
-    rows = [[{'text': '🔄 Обновить статус', 'callback_data': f'status:{n}'}]]
-    if game['stage'] == 'ready':
-        rows.insert(0, [{'text': '🚀 Раздать роли', 'callback_data': f'begin:{n}'}])
-    elif game['stage'] == 'playing':
-        rows.append([{'text': '🏁 Завершить и показать результат', 'callback_data': f'finish:{n}'}])
-    elif game['stage'] in ('count', 'word'):
-        rows.insert(0, [{'text': '⚙️ Продолжить настройку', 'url': f'https://t.me/{USERNAME}?start=setup_{n}'}])
-    if game['stage'] not in ('playing', 'finished', 'cancelled'):
-        rows.append([{'text': 'Отменить игру', 'callback_data': f'stop:{n}'}])
-    return {'inline_keyboard': rows}
-
-
-def refresh_host(gid, message_id=None):
-    game = games[gid]
-    ids = [message_id] if message_id else game.get('host_panel_ids', [])
-    for mid in ids:
+    def upsert(self, cid, mid, text, keyboard, force=False, private=False):
+        """Edit one tracked message; only send if it doesn't exist any more."""
+        signature = (text, json.dumps(keyboard, ensure_ascii=False, sort_keys=True))
+        key = (cid, mid)
+        at = self.clock()
+        if mid and self.cache.get(key) == signature:
+            return mid, True
+        if at < self.global_cooldown or at < self.cooldown.get(key, 0):
+            if force:
+                raise ApiError('Telegram просит немного подождать. Нажми ещё раз позже.')
+            return mid, False
+        if mid and not force and at - self.last_edit.get(key, 0) < (1.1 if private else 3.2):
+            return mid, False
+        params = {'chat_id': cid, 'text': text, 'reply_markup': keyboard,
+                  'link_preview_options': {'is_disabled': True}}
         try:
-            api('editMessageText', chat_id=game['admin'], message_id=mid,
-                text=lobby_text(game), reply_markup=host_keyboard(game))
-        except RuntimeError as exc:
-            if 'message is not modified' not in str(exc):
-                logging.warning('Host panel refresh: %s', exc)
-
-
-def publish_host_status(gid):
-    game = games[gid]
-    message = send(game['admin'], lobby_text(game), reply_markup=host_keyboard(game))
-    if isinstance(message, dict) and message.get('message_id'):
-        game['host_panel_ids'] = (game.get('host_panel_ids', []) + [message['message_id']])[-3:]
-        save()
-
-
-def ask_count(uid):
-    game = games[pending[uid]]
-    send(uid, "Шаг 1 из 2. Сколько будет импостеров?\nВыбери кнопку или отправь число от 1 до 20.", reply_markup={"inline_keyboard": [[{"text": str(n), "callback_data": f"count:{game['nonce']}:{n}"} for n in (1, 2, 3)]]})
-
-
-def refresh(group_id, message_id=None):
-    game = games[group_id]
-    ids = [message_id] if message_id else list(dict.fromkeys([game.get('message_id')] + game.get('status_ids', [])))
-    for mid in ids:
-        if not mid:
-            continue
-        try:
-            api("editMessageText", chat_id=group_id, message_id=mid, text=lobby_text(game), reply_markup=keyboard(game))
-        except RuntimeError as exc:
-            if "message is not modified" not in str(exc):
-                logging.warning("Lobby refresh: %s", exc)
-    if message_id is None:
-        refresh_host(group_id)
-
-
-def publish_status(gid):
-    game = games[gid]
-    message = send(gid, lobby_text(game), reply_markup=keyboard(game))
-    if isinstance(message, dict) and message.get('message_id'):
-        game['status_ids'] = (game.get('status_ids', []) + [message['message_id']])[-3:]
-        save()
-
-
-def stop_game(gid):
-    if 'imposters' in games[gid]:
-        finish_game(gid)
-        return
-    games[gid]['stage'] = 'cancelled'
-    refresh(gid)
-    game = games.pop(gid)
-    if pending.get(game['admin']) == gid:
-        pending.pop(game['admin'])
-    save()
-    send(gid, "Игра завершена.")
-    menu(gid)
-
-
-def finish_game(gid):
-    game = games[gid]
-    if game['stage'] == 'finished':
-        return
-    if 'imposters' not in game:
-        send(gid, 'Роли ещё не раздавались. Пока можно только отменить лобби.')
-        return
-    game['stage'] = 'finished'
-    save()
-    refresh(gid)
-    publish_status(gid)
-
-
-def start_game(group_id):
-    game = games[group_id]
-    players = list(game["players"].values())
-    count = game["count"]
-    if len(players) < count + 1:
-        send(group_id, f"Пока мало игроков: {len(players)}. Для {count} импостеров нужно минимум {count + 1} игроков. Нажимайте «Участвую» в сообщении выше.", reply_markup=controls(game))
-        return
-    if "imposters" not in game:
-        game["imposters"] = {p["id"] for p in random.SystemRandom().sample(players, count)}
-        game["delivered"] = set()
-        save()
-        refresh(group_id)
-    imposters = game["imposters"]
-    delivered = []
-    failed = []
-    for player in players:
-        if player["id"] in game["delivered"]:
-            continue
-        role = "🎭 Ты ИМПОСТЕР. Секретное слово тебе неизвестно." if player["id"] in imposters else f"🔒 Секретное слово: {game['word']}"
-        try:
-            send(player["id"], role, protect_content=True)
-            game["delivered"].add(player["id"])
-            save()
-            delivered.append(player)
-            time.sleep(0.05)
-        except RuntimeError as exc:
-            logging.warning("DM failed for user %s: %s", player["id"], exc)
-            failed.append(player)
-    if failed:
-        refresh(group_id)
-        send(group_id, "Не смог отправить роль: " + ", ".join(name(p) for p in failed) + ". Откройте личку с ботом и нажмите Start. Затем ведущий нажимает «Раздать роли» ещё раз; назначенные роли сохранятся.", reply_markup=controls(game))
-        return
-    game["stage"] = "playing"
-    save()
-    refresh(group_id)
-    publish_status(group_id)
-
-
-def on_message(msg):
-    chat = msg['chat']
-    user = msg.get('from')
-    if not user or user.get('is_bot'):
-        return
-    uid, cid = user['id'], chat['id']
-    text = (msg.get('text') or '').strip()
-    command = text.split(maxsplit=1)[0].split('@')[0].lower() if text.startswith('/') else ''
-    if command and '@' in text.split(maxsplit=1)[0]:
-        if text.split(maxsplit=1)[0].split('@', 1)[1].lower() != USERNAME.lower():
-            return
-    if chat['type'] == 'private':
-        if command in ('/start', '/help'):
-            arg = text.partition(' ')[2]
-            if arg.startswith(('join_', 'setup_')):
-                kind, nonce = arg.split('_', 1)
-                match = next(((gid, g) for gid, g in games.items() if g['nonce'] == nonce), None)
-                if not match:
-                    send(cid, 'Эта игра уже завершена. Нажми кнопку в новой игре в группе.')
-                    return
-                gid, game = match
-                if kind == 'setup':
-                    if uid != game['admin']:
-                        send(cid, 'Настраивает игру её создатель. Для участия нажми «Участвую» в группе.')
-                        return
-                    if game['stage'] in ('playing', 'finished'):
-                        publish_host_status(gid)
-                        return
-                    pending[uid] = gid
-                    if game['stage'] == 'count':
-                        ask_count(uid)
-                    elif game['stage'] == 'word':
-                        send(cid, 'Шаг 2 из 2. Отправь секретное слово или короткую фразу. Слово увидят только обычные игроки.')
+            if mid:
+                try:
+                    self.api.call('editMessageText', message_id=mid, **params)
+                except ApiError as exc:
+                    if 'message is not modified' in str(exc).lower():
+                        pass
+                    elif exc.code == 400 and any(t in str(exc).lower() for t in
+                            ("message to edit not found", "message can't be edited", 'message_id_invalid')):
+                        mid = None
                     else:
-                        publish_host_status(gid)
-                    return
-                if game['stage'] in ('playing', 'finished') or 'imposters' in game:
-                    send(cid, 'Раздача уже началась. Присоединяйся к следующей игре.')
-                    return
-                if uid == game['admin']:
-                    publish_host_status(gid)
-                    return
-                if uid not in game['players'] and len(game['players']) >= 50:
-                    send(cid, 'Уже набралось 50 игроков. Присоединяйся в следующем раунде.')
-                    return
-                game['players'][uid] = user
-                save()
-                send(cid, '✅ Ты в игре! Вернись в группу. Я пришлю сюда роль, когда ведущий начнёт раздачу.')
-                refresh(gid)
-                return
-            gid = pending.get(uid)
-            if gid in games and games[gid]['stage'] == 'count':
-                ask_count(uid)
-                return
-            if gid in games and games[gid]['admin'] == uid:
-                publish_host_status(gid)
-                return
-            send(cid, '🎭 Привет! Добавь меня в группу, затем нажми «Новая игра». Стать ведущим может любой участник. Чтобы играть, нажми «Участвую» в группе.', reply_markup={'inline_keyboard': [[{'text': '➕ Добавить в группу', 'url': f'https://t.me/{USERNAME}?startgroup=game'}]]})
-            return
-        gid = pending.get(uid)
-        game = games.get(gid)
-        if command in ('/cancel', '/stop'):
-            if game and game['admin'] == uid:
-                stop_game(gid)
-            send(cid, 'Готово. Новую игру можно создать в группе.')
-            return
-        if not game or game['admin'] != uid:
-            send(cid, 'Чтобы играть, нажми «Участвую» в группе. Чтобы стать ведущим, создай там новую игру: /newgame')
-            return
-        if command in ('/status', '/players', '/results'):
-            publish_host_status(gid)
-            return
-        if command == '/begin':
-            begin(gid, uid)
-            return
-        if command:
-            send(cid, 'Следуй шагам настройки или отправь /cancel для отмены.')
-            return
-        if game['stage'] == 'count':
-            if not text.isdecimal() or len(text) > 2 or not 1 <= int(text) <= 20:
-                ask_count(uid)
-                return
-            game['count'] = int(text)
-            game['stage'] = 'word'
-            refresh(gid)
-            send(cid, 'Шаг 2 из 2. Отправь секретное слово или короткую фразу (до 100 символов).')
-        elif game['stage'] == 'word':
-            if not text or len(text) > 100:
-                send(cid, 'Нужно слово или фраза до 100 символов.')
-                return
-            game['word'] = text
-            game['stage'] = 'ready'
-            save()
-            refresh(gid)
-            publish_host_status(gid)
-        elif game['stage'] == 'ready':
-            publish_host_status(gid)
-        else:
-            send(cid, 'Роли уже отправлены. Следующую игру можно создать в группе.')
-        return
-    if chat['type'] not in ('group', 'supergroup'):
-        return
-    if command in ('/status', '/players', '/results'):
-        if cid in games:
-            refresh(cid)
-            publish_status(cid)
-        else:
-            menu(cid)
-    elif command == '/finish':
-        if cid in games and uid == games[cid]['admin']:
-            finish_game(cid)
-        else:
-            send(cid, 'Показать результат может только создатель текущей игры.')
-    elif command in ('/start', '/help') or any(u.get('username', '').lower() == USERNAME.lower() for u in msg.get('new_chat_members', [])):
-        menu(cid)
-    elif command == '/newgame':
-        if cid in games and games[cid]['stage'] != 'finished':
-            send(cid, 'Игра уже создана. Посмотреть участников: /status. Перед новой игрой ведущий должен завершить текущую.')
-            return
-        if uid in pending and pending[uid] != cid and pending[uid] in games and games[pending[uid]]['stage'] != 'finished':
-            send(cid, 'Ты уже ведущий в другой группе. Сначала заверши ту игру или отправь /cancel в личке.')
-            return
-        game = {'admin': uid, 'host_name': name(user), 'players': {}, 'stage': 'count', 'count': None, 'word': None, 'nonce': secrets.token_urlsafe(12)}
-        games[cid] = game
-        pending[uid] = cid
-        game['message_id'] = send(cid, lobby_text(game), reply_markup=keyboard(game))['message_id']
-        save()
-    elif command == '/begin':
-        begin(cid, uid)
-    elif command == '/stop':
-        game = games.get(cid)
-        if game and uid == game['admin']:
-            stop_game(cid)
-        elif game:
-            send(cid, 'Завершить игру может её создатель.')
-        else:
-            menu(cid)
+                        raise
+            if not mid:
+                message = self.api.call('sendMessage', protect_content=private,
+                                        disable_notification=True, **params)
+                mid = message['message_id']
+        except ApiError as exc:
+            self.cooldown[key] = at + max(exc.retry_after, 10 if exc.code != 403 else 120)
+            if exc.retry_after:
+                self.global_cooldown = at + exc.retry_after
+            raise
+        self.cache[(cid, mid)] = signature
+        self.last_edit[(cid, mid)] = at
+        return mid, True
 
+    def group_panel(self, gid, force=False):
+        g = self.store.games.get(gid)
+        if g:
+            text, keyboard = ui.group_panel(g, self.username, self.clock())
+            mid = g.get('message_id') or self.store.data['boards'].get(gid)
+        else:
+            text = '🎭 ИМПОСТЕР\n\nЗнаешь слово? Дай ассоциацию и вычисли тех, кто притворяется.\n\nСоздать игру может любой участник. Всё управление — кнопками. Личные роли и голоса бот пришлёт в личку.'
+            keyboard = ui.kb([[ui.button('🎲 Новая игра', 'newgame')],
+                              [ui.url('📖 Как играть', f'https://t.me/{self.username}?start=rules')]])
+            mid = self.store.data['boards'].get(gid)
+        new_mid, complete = self.upsert(gid, mid, text, keyboard, force=force)
+        if new_mid:
+            self.store.data['boards'][gid] = new_mid
+            if g:
+                g['message_id'] = new_mid
+        if new_mid != mid:
+            self.save()
+        return complete
 
-def begin(gid, uid):
-    game = games.get(gid)
-    if not game:
-        return
-    if uid != game['admin']:
-        send(gid, 'Раздать роли может только создатель этой игры.')
-    elif game['stage'] == 'ready':
-        start_game(gid)
-    elif game['stage'] == 'playing':
-        send(gid, 'Роли уже отправлены. Можно играть!')
-    elif game['stage'] == 'finished':
-        send(gid, 'Игра завершена. Нажми «Следующая игра» в табло.')
-    else:
-        send(gid, 'Сначала ведущий задаёт число импостеров и слово. Нажми «Настроить игру» в сообщении выше.')
+    def private_panel(self, gid, uid, force=False):
+        g = self.store.games[gid]
+        g.setdefault('panels', {})
+        text, keyboard = ui.private_panel(g, uid, self.username, self.clock())
+        mid = g['panels'].get(uid)
+        new_mid, complete = self.upsert(uid, mid, text, keyboard, force=force, private=True)
+        if new_mid:
+            g['panels'][uid] = new_mid
+        if new_mid != mid:
+            self.save()
+        return complete
 
+    def home(self, uid, rules=False):
+        if rules:
+            text = ui.RULES
+            rows = [[ui.button('← Мои игры', 'home')]]
+        else:
+            text = '🎭 ИМПОСТЕР\n\nНайди игру в группе или добавь меня в свою. Чтобы присоединиться, нажми «Участвую» в групповом табло.'
+            rows = []
+            stats = self.store.data['stats'].get(uid)
+            if stats:
+                text += f"\n\nТвои результаты: игр {stats['games']}, побед {stats['wins']}."
+            for g in list(self.store.games.values())[-15:]:
+                if uid == g['admin'] or uid in g['players']:
+                    rows.append([ui.button((g.get('group_title') or 'Моя игра')[:35], ui.code(g, 'open'))])
+            rows += [[ui.url('➕ Добавить в группу', f'https://t.me/{self.username}?startgroup=game')],
+                     [ui.button('📖 Правила', 'rules_home')]]
+        mid = self.store.data['homes'].get(uid)
+        new_mid, _ = self.upsert(uid, mid, text, ui.kb(rows), force=True, private=True)
+        self.store.data['homes'][uid] = new_mid
+        self.save()
 
-def on_callback(query):
-    data = query.get('data', '')
-    user = query['from']
-    uid = user['id']
-    msg = query.get('message') or {}
-    chat = msg.get('chat') or {}
-    if data == 'newgame':
-        api('answerCallbackQuery', callback_query_id=query['id'])
-        if chat.get('type') in ('group', 'supergroup'):
-            on_message({'chat': chat, 'from': user, 'text': '/newgame'})
-        return
-    parts = data.split(':')
-    match = next(((gid, g) for gid, g in games.items() if len(parts) > 1 and g['nonce'] == parts[1]), None)
-    if not match:
-        api('answerCallbackQuery', callback_query_id=query['id'], text='Кнопка от старой игры. Открой текущую игру в группе.', show_alert=True)
-        return
-    gid, game = match
-    action = parts[0]
-    if action in ('count', 'begin', 'stop', 'finish') and uid != game['admin']:
-        api('answerCallbackQuery', callback_query_id=query['id'], text='Этой игрой управляет её создатель.', show_alert=True)
-        return
-    api('answerCallbackQuery', callback_query_id=query['id'])
-    if uid == game['admin'] and chat.get('type') == 'private' and chat.get('id') == uid and msg.get('message_id') and action in ('status', 'begin', 'finish', 'stop'):
-        game['host_panel_ids'] = list(dict.fromkeys(game.get('host_panel_ids', []) + [msg['message_id']]))[-3:]
-        refresh_host(gid, msg['message_id'])
-    if action == 'count' and game['stage'] == 'count' and len(parts) == 3:
-        pending[uid] = gid
-        on_message({'chat': {'id': uid, 'type': 'private'}, 'from': user, 'text': parts[2]})
-    elif action == 'begin':
-        begin(gid, uid)
-    elif action == 'stop':
-        stop_game(gid)
-    elif action == 'finish':
-        finish_game(gid)
-    elif action == 'status':
-        if chat.get('id') == gid:
-            refresh(gid, msg.get('message_id'))
-    elif action == 'leave' and game['stage'] not in ('playing', 'finished') and 'imposters' not in game:
-        game['players'].pop(uid, None)
-        refresh(gid)
-    save()
+    def find(self, nonce):
+        return next(((gid, g) for gid, g in self.store.games.items() if g['nonce'] == nonce), None)
+
+    def focus(self, uid, gid):
+        self.store.data['pending'][uid] = gid
+
+    def focused(self, uid):
+        gid = self.store.data['pending'].get(uid)
+        g = self.store.games.get(gid)
+        if g and (uid == g['admin'] or uid in g['players']):
+            return gid, g
+        matches = [(gid, g) for gid, g in self.store.games.items()
+                   if uid == g['admin'] or uid in g['players']]
+        return matches[-1] if matches else (None, None)
+
+    def create(self, gid, user, title='', rematch=False):
+        old = self.store.games.get(gid)
+        if old and old['stage'] not in game.END_STAGES:
+            raise game.GameError('Игра уже идёт. Участвуй или дождись результата.')
+        if old:
+            self.score(old)
+        for other_gid, other in self.store.games.items():
+            if other_gid != gid and other['admin'] == user['id'] and other['stage'] not in game.END_STAGES:
+                raise game.GameError('Ты уже управляешь игрой в другой группе. Сначала заверши её.')
+        g = game.fresh(user, title or (old or {}).get('group_title', ''), old, rematch)
+        self.store.games[gid] = g
+        self.focus(user['id'], gid)
+        self.touch(gid)
+        return g
+
+    def deliver(self, gid, retry=True):
+        g = self.store.games[gid]
+        self.save()  # Persist assignments before the first network delivery.
+        failed = set(g.get('delivery_errors', []))
+        attempted = 0
+        for uid in g['players']:
+            if uid in g['delivered']:
+                continue
+            if not retry and uid in failed:
+                continue
+            if attempted >= 8:
+                break
+            attempted += 1
+            try:
+                self.private_panel(gid, uid, force=True)
+                g['delivered'].append(uid)
+                failed.discard(uid)
+                self.save()
+            except ApiError as exc:
+                logging.warning('Role delivery failed for user %s: %s', uid, exc)
+                failed.add(uid)
+                if exc.code == 0 or exc.retry_after:
+                    # Avoid serial network timeouts for every remaining player.
+                    failed.update(set(g['players']) - set(g['delivered']))
+                    break
+        g['delivery_errors'] = sorted(failed)
+        g['delivery_auto'] = bool(set(g['players']) - set(g['delivered']) - failed)
+        if set(g['delivered']) == set(g['players']):
+            g['delivery_auto'] = False
+            game.dealt(g, self.clock())
+        self.touch(gid)
+
+    def score(self, g):
+        if g['stage'] != 'finished' or g.get('winner') not in ('players', 'imposters') or g.get('scored'):
+            return
+        for uid in g['players']:
+            stat = self.store.data['stats'].setdefault(uid, {'games': 0, 'wins': 0})
+            stat['games'] += 1
+            if (uid in g['imposters']) == (g['winner'] == 'imposters'):
+                stat['wins'] += 1
+        g['scored'] = True
+        self.save()
+
+    def flush(self):
+        """Coalesce bursts and edit at most 16 panels per pass."""
+        budget = 16
+        for gid in list(self.dirty):
+            g = self.store.games.get(gid)
+            if not g:
+                self.dirty.discard(gid)
+                continue
+            self.score(g)
+            complete = True
+            try:
+                complete = self.group_panel(gid)
+            except ApiError as exc:
+                logging.warning('Group panel: %s', exc)
+                complete = False
+            for uid in list(g.get('panels', {})):
+                if g['stage'] == 'dealing' and uid in g['players'] and uid not in g.get('delivered', []):
+                    continue  # Explicit delivery retry records whether the role arrived.
+                text, keyboard = ui.private_panel(g, uid, self.username, self.clock())
+                key = (uid, g['panels'][uid])
+                signature = (text, json.dumps(keyboard, ensure_ascii=False, sort_keys=True))
+                if self.cache.get(key) == signature:
+                    continue
+                if budget <= 0:
+                    complete = False
+                    break
+                budget -= 1
+                try:
+                    complete = self.private_panel(gid, uid) and complete
+                except ApiError as exc:
+                    logging.warning('Private panel: %s', exc)
+                    complete = False
+            if complete:
+                self.dirty.discard(gid)
+            if budget <= 0:
+                break
+
+    def timers(self):
+        at = self.clock()
+        bucket = int(at // 15)
+        changed = False
+        for gid, g in self.store.games.items():
+            if g['stage'] == 'dealing' and g.get('delivery_auto'):
+                self.deliver(gid, retry=False)
+            if game.tick(g, at):
+                g['views'] = {} if g['stage'] != 'voting' else g.get('views', {})
+                changed = True
+                self.dirty.add(gid)
+            elif bucket != self.last_timer and g.get('deadline'):
+                self.dirty.add(gid)
+        self.last_timer = bucket
+        if changed:
+            self.save()
+
+    def stop(self, gid, uid):
+        g = self.store.games[gid]
+        game.owner(g, uid)
+        if g['stage'] in game.END_STAGES:
+            return
+        game.finish(g, 'stopped', 'Создатель завершил игру досрочно.')
+        self.touch(gid)
+
+    def act(self, gid, uid, action, arg=None, user=None):
+        g = self.store.games[gid]
+        views = g.setdefault('views', {})
+        if action == 'mode':
+            game.choose_mode(g, uid, arg)
+            if arg == 'random':
+                game.join(g, user)
+        elif action == 'count':
+            game.set_count(g, uid, int(arg))
+        elif action == 'join':
+            game.join(g, user)
+        elif action == 'leave':
+            game.leave(g, uid)
+        elif action == 'begin':
+            game.prepare(g, uid)
+            self.deliver(gid)
+        elif action == 'said':
+            game.clue(g, uid, at=self.clock())
+        elif action == 'advance':
+            game.advance(g, uid, self.clock())
+        elif action == 'ready':
+            game.ready_vote(g, uid, self.clock())
+        elif action in ('ballot', 'vp'):
+            if g['stage'] != 'voting' or uid not in game.live(g):
+                raise game.GameError('Голосуют только оставшиеся игроки.')
+            views[uid] = f'ballot:{max(0, min(6, int(arg or 0)))}'
+        elif action == 'vote':
+            epoch = g['epoch']
+            game.cast_vote(g, uid, int(arg), self.clock())
+            if epoch == g['epoch']:
+                views[uid] = ''
+        elif action == 'roster':
+            views[uid] = f'roster:{max(0, min(4, int(arg or 0)))}'
+        elif action == 'rules':
+            views[uid] = 'rules'
+        elif action in ('panel', 'open', 'status'):
+            views[uid] = ''
+        elif action in ('abort', 'finish', 'stop'):
+            game.owner(g, uid)
+            views[uid] = 'abort'
+        elif action == 'confirm':
+            game.owner(g, uid)
+            if views.get(uid) != 'abort':
+                raise game.GameError('Сначала нажми «Завершить досрочно».')
+            self.stop(gid, uid)
+        else:
+            raise game.GameError('Эта кнопка устарела. Открой актуальную панель.')
+        self.focus(uid, gid)
+        self.touch(gid)
+
+    def callback(self, q):
+        uid = q['from']['id']
+        data = q.get('data', '')
+        message = q.get('message') or {}
+        chat = message.get('chat') or {}
+        private = chat.get('type') == 'private'
+        answered = False
+
+        def answer(text='', alert=False):
+            nonlocal answered
+            answered = True
+            self.api.call('answerCallbackQuery', callback_query_id=q['id'], text=text[:190], show_alert=alert)
+
+        try:
+            if data in ('home', 'rules_home'):
+                answer()
+                if private:
+                    self.home(uid, data == 'rules_home')
+                return
+            if data == 'newgame':
+                if private or chat.get('type') not in ('group', 'supergroup'):
+                    raise game.GameError('Создай игру кнопкой в своей группе.')
+                self.create(chat['id'], q['from'], chat.get('title', ''))
+                answer('Игра создана. Нажми «Создателю: настройка».')
+                return
+            parts = data.split(':')
+            if len(parts) < 2:
+                raise game.GameError('Старая кнопка. Открой текущую игру.')
+            action, nonce = parts[:2]
+            match = self.find(nonce)
+            if not match:
+                raise game.GameError('Это кнопка от прошлой игры. Открой актуальное табло в группе.')
+            gid, g = match
+            if not private and chat.get('id') != gid:
+                raise game.GameError('Открой игру в её группе.')
+            if private and chat.get('id') != uid:
+                raise game.GameError('Открой бота в своей личке.')
+            arg = parts[2] if len(parts) > 2 else None
+            phase_actions = {'mode', 'count', 'said', 'advance', 'ready', 'ballot', 'vp', 'vote'}
+            if action in phase_actions:
+                # Old count buttons carried no phase. Only accept their old exact setup stage.
+                if action == 'count' and len(parts) == 3 and g['stage'] == 'count':
+                    arg = parts[2]
+                else:
+                    if len(parts) < 3 or int(parts[2]) != g['epoch']:
+                        raise game.GameError('Этап уже сменился. Панель обновляется; нажми актуальную кнопку.')
+                    arg = parts[3] if len(parts) > 3 else None
+            if action == 'rematch':
+                if g['stage'] not in game.END_STAGES:
+                    raise game.GameError('Сначала закончите текущую игру.')
+                game.owner(g, uid)
+                g = self.create(gid, q['from'], rematch=True)
+                answer('Реванш создан! Состав сохранён.')
+                if private:
+                    self.private_panel(gid, uid, force=True)
+                return
+            if action == 'vote' and not private:
+                raise game.GameError('Выбирай игрока в личной панели.')
+            if private:
+                if uid != g['admin'] and uid not in g['players'] and action not in ('join', 'rules', 'panel', 'open', 'status'):
+                    raise game.GameError('Сначала вступи в игру.')
+                if action != 'open' and message.get('message_id') != self.store.data['homes'].get(uid) and message.get('message_id'):
+                    g.setdefault('panels', {})[uid] = message['message_id']
+            if action == 'begin':
+                game.owner(g, uid)
+                # Answer before potentially long delivery to all participants.
+                game.prepare(g, uid)
+                self.touch(gid)
+                answer('Раздаю роли…')
+                self.deliver(gid)
+            else:
+                self.act(gid, uid, action, arg, q['from'])
+                answer('Голос принят' if action == 'vote' else '')
+            if private:
+                self.private_panel(gid, uid, force=True)
+            elif action in ('abort', 'stop', 'finish'):
+                try:
+                    self.private_panel(gid, uid, force=True)
+                except ApiError:
+                    pass  # Group creator can always reach setup via the deep link.
+        except (game.GameError, ValueError) as exc:
+            if not answered:
+                answer(str(exc) if isinstance(exc, game.GameError) else 'Эта кнопка устарела.', True)
+        except ApiError as exc:
+            logging.warning('Callback: %s', exc)
+            if not answered:
+                answer('Telegram временно недоступен. Попробуй ещё раз.', True)
+
+    def private_message(self, m, command, text):
+        uid = m['from']['id']
+        # A new incoming private interaction proves the bot is unblocked again.
+        self.cooldown = {key: value for key, value in self.cooldown.items() if key[0] != uid}
+        arg = text.partition(' ')[2]
+        if command == '/start' and arg == 'rules':
+            self.home(uid, rules=True)
+            return
+        match = None
+        kind = ''
+        if command == '/start' and arg.startswith(('join_', 'setup_', 'play_', 'vote_')):
+            kind, nonce = arg.split('_', 1)
+            match = self.find(nonce)
+            if not match:
+                self.home(uid)
+                return
+        gid, g = match or self.focused(uid)
+        if not g:
+            self.home(uid)
+            return
+        self.focus(uid, gid)
+        if kind == 'join':
+            if uid in g['players'] and g['stage'] not in game.LOBBY_STAGES:
+                pass  # Open an existing role, including a failed delivery.
+            elif uid == g['admin'] and g['mode'] == 'manual':
+                pass
+            else:
+                game.join(g, m['from'])
+        if kind == 'setup' and uid != g['admin']:
+            # A mistaken click still opens their own public/personal game panel.
+            g.setdefault('views', {})[uid] = ''
+        if kind == 'vote' and g['stage'] == 'voting' and uid in game.live(g):
+            g.setdefault('views', {})[uid] = 'ballot:0'
+        elif command in ('/start', '/status', '/players', '/results', '/help'):
+            g.setdefault('views', {})[uid] = ''
+            if kind == 'vote' and g['stage'] == 'voting' and uid in game.live(g):
+                g['views'][uid] = 'ballot:0'
+        elif command in ('/cancel', '/stop', '/finish'):
+            self.act(gid, uid, 'abort')
+        elif command == '/begin':
+            self.act(gid, uid, 'begin')
+        elif not command:
+            if uid == g['admin'] and g['stage'] == 'count':
+                if not text.isdecimal() or len(text) > 2:
+                    raise game.GameError('Выбери кнопку или отправь число от 1 до 20.')
+                game.set_count(g, uid, int(text))
+            elif uid == g['admin'] and g['stage'] == 'word':
+                game.set_word(g, uid, text)
+            elif game.current(g) == uid:
+                game.clue(g, uid, text, self.clock())
+            elif g['stage'] == 'guess' and uid == g.get('guesser'):
+                game.guess(g, uid, text)
+            else:
+                # No reply spam: bring the existing panel up to date.
+                pass
+        self.touch(gid)
+        self.private_panel(gid, uid, force=True)
+        if g['stage'] == 'dealing' and uid in g['players'] and uid not in g.get('delivered', []):
+            g['delivered'].append(uid)
+            g['delivery_errors'] = [x for x in g.get('delivery_errors', []) if x != uid]
+            if set(g['delivered']) == set(g['players']):
+                game.dealt(g, self.clock())
+            self.touch(gid)
+
+    def message(self, m):
+        chat, user = m['chat'], m.get('from', {})
+        cid = chat['id']
+        if m.get('migrate_to_chat_id'):
+            new = m['migrate_to_chat_id']
+            if cid in self.store.games:
+                self.store.games[new] = self.store.games.pop(cid)
+                self.store.games[new].pop('message_id', None)
+            self.store.data['boards'].pop(cid, None)
+            for uid, gid in self.store.data['pending'].items():
+                if gid == cid:
+                    self.store.data['pending'][uid] = new
+            self.dirty.discard(cid)
+            self.touch(new)
+            return
+        if not user or user.get('is_bot'):
+            return
+        text = (m.get('text') or '').strip()
+        command = text.split(maxsplit=1)[0].lower() if text.startswith('/') else ''
+        if '@' in command:
+            command, target = command.split('@', 1)
+            if target != self.username.lower():
+                return
+        if chat['type'] == 'private':
+            self.private_message(m, command, text)
+        elif chat['type'] in ('group', 'supergroup'):
+            added = any(u.get('username', '').lower() == self.username.lower() for u in m.get('new_chat_members', []))
+            if command == '/newgame':
+                self.create(cid, user, chat.get('title', ''))
+            elif command == '/begin' and cid in self.store.games:
+                self.act(cid, user['id'], 'begin')
+            elif command in ('/stop', '/finish', '/cancel') and cid in self.store.games:
+                self.act(cid, user['id'], 'abort')
+                self.private_panel(cid, user['id'], force=True)
+            elif command in ('/start', '/help', '/status', '/players', '/results') or added:
+                self.group_panel(cid, force=True)
+                if cid in self.store.games:
+                    self.dirty.add(cid)
+            elif cid in self.store.games and not command:
+                g = self.store.games[cid]
+                if (m.get('reply_to_message') or {}).get('message_id') == g.get('message_id') and game.current(g) == user['id']:
+                    game.clue(g, user['id'], text, self.clock())
+                    self.touch(cid)
+
+    def handle(self, update):
+        try:
+            if 'callback_query' in update:
+                self.callback(update['callback_query'])
+            elif 'message' in update:
+                self.message(update['message'])
+            elif 'my_chat_member' in update:
+                member = update['my_chat_member']
+                if member['chat']['type'] in ('group', 'supergroup') and member['new_chat_member']['status'] in ('member', 'administrator'):
+                    self.group_panel(member['chat']['id'], force=True)
+        except game.GameError as exc:
+            # Text-entry errors get one brief private reply. The group stays quiet.
+            m = update.get('message', {})
+            if m.get('chat', {}).get('type') == 'private':
+                self.api.call('sendMessage', chat_id=m['chat']['id'], text=str(exc), disable_notification=True)
+            logging.info('User action rejected: %s', exc)
+        self.store.data['offset'] = update['update_id'] + 1
+        self.save()
 
 
 def main():
-    global offset, USERNAME
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if not TOKEN:
-        raise SystemExit("Set BOT_TOKEN in /etc/imposter-bot.env or environment")
-    load()
-    USERNAME = api("getMe")["username"]
-    webhook = api("getWebhookInfo")
-    if webhook.get("url"):
-        raise SystemExit("This token has an active webhook; use a new dedicated bot or remove its webhook first")
-    api("setMyCommands", commands=[{"command": c, "description": d} for c, d in [("newgame", "Создать игру — стать ведущим"), ("status", "Табло: игроки и состояние игры"), ("results", "Результат завершённой игры"), ("finish", "Завершить и раскрыть роли (ведущий)"), ("begin", "Раздать роли (ведущий)"), ("stop", "Завершить игру (ведущий)"), ("start", "Открыть бота"), ("cancel", "Отменить настройку в личке")]])
-    logging.info("Bot started")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--check-state', action='store_true')
+    args = parser.parse_args()
+    store = Store(os.environ.get('STATE_FILE', 'data/state.json'))
+    if args.check_state:
+        print(f'State compatible: {len(store.games)} games. No files changed.')
+        return
+    token = os.environ.get('BOT_TOKEN', '')
+    if not token:
+        raise SystemExit('Set BOT_TOKEN in /etc/imposter-bot.env')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    api = Telegram(token)
+    me = api.call('getMe')
+    if api.call('getWebhookInfo').get('url'):
+        raise SystemExit('This token has a webhook. Use a dedicated bot or remove its webhook first.')
+    api.call('setMyCommands', commands=[{'command': 'start', 'description': 'Открыть меню игры'},
+                                       {'command': 'status', 'description': 'Обновить табло'},
+                                       {'command': 'help', 'description': 'Правила и помощь'}])
+    api.call('setChatMenuButton', menu_button={'type': 'commands'})
+    bot = Bot(store, api, me['username'])
+    logging.info('Bot started: @%s, saved games: %s', me['username'], len(store.games))
     while True:
         try:
-            updates = api("getUpdates", offset=offset, timeout=25, allowed_updates=["message", "callback_query"])
+            bot.timers()
+            bot.flush()
+            updates = api.call('getUpdates', offset=store.data['offset'], timeout=2,
+                               allowed_updates=['message', 'callback_query', 'my_chat_member'])
             for update in updates:
-                offset = update["update_id"] + 1
                 try:
-                    if "message" in update:
-                        on_message(update["message"])
-                    elif "callback_query" in update:
-                        on_callback(update["callback_query"])
-                    save()
+                    bot.handle(update)
+                except ApiError as exc:
+                    logging.warning('Telegram update failed; will retry: %s', exc)
+                    # Don't acknowledge this update if an essential network operation failed.
+                    break
                 except Exception:
-                    logging.exception("Update failed")
+                    logging.exception('Update failed')
+                    store.data['offset'] = update['update_id'] + 1
+                    store.save()
+        except ApiError as exc:
+            logging.warning('Telegram unavailable: %s', exc)
+            time.sleep(min(max(exc.retry_after, 2), 10))
         except Exception:
-            logging.exception("Polling failed; retrying")
-            time.sleep(5)
+            logging.exception('Main loop error')
+            time.sleep(2)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
