@@ -38,7 +38,7 @@ class GameTests(unittest.TestCase):
         with patch.object(bot, 'send', side_effect=lambda cid, text, **kw: retried.append(cid)), patch.object(bot.time, 'sleep'):
             bot.start_game(-1)
         self.assertEqual([cid for cid in retried if cid > 0], [3])
-        self.assertEqual(bot.games[-1]['stage'], 'done')
+        self.assertEqual(bot.games[-1]['stage'], 'playing')
 
     def test_too_few_players_no_assignment(self):
         bot.games[-1]['count'] = 6
@@ -100,6 +100,42 @@ class GameTests(unittest.TestCase):
         with patch.object(bot, 'send'):
             bot.on_message({'chat': {'id': 99, 'type': 'private'}, 'from': {'id': 99}, 'text': '/start join_testnonce'})
         self.assertNotIn(99, bot.games[-1]['players'])
+
+    def test_status_hides_secrets_until_host_finishes(self):
+        game = bot.games[-1]
+        game.update(stage='playing', imposters={1, 2}, delivered=set(range(1, 7)))
+        self.assertNotIn('такси', bot.lobby_text(game))
+        self.assertIn('6/6', bot.lobby_text(game))
+        with patch.object(bot, 'send'), patch.object(bot, 'api'), patch.object(bot, 'refresh'):
+            bot.on_callback({'id': 'q', 'data': 'finish:testnonce', 'from': {'id': 3}})
+            self.assertEqual(game['stage'], 'playing')
+            bot.on_callback({'id': 'q', 'data': 'finish:testnonce', 'from': {'id': 99}})
+        self.assertEqual(game['stage'], 'finished')
+        self.assertIn('такси', bot.lobby_text(game))
+        self.assertIn('Импостеры: 1, 2', bot.lobby_text(game))
+        bot.load()
+        self.assertEqual(bot.games[-1]['stage'], 'finished')
+
+    def test_game_cannot_be_replaced_before_results(self):
+        bot.games[-1]['stage'] = 'playing'
+        with patch.object(bot, 'send'):
+            bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 3}, 'text': '/newgame'})
+        self.assertEqual(bot.games[-1]['admin'], 99)
+
+    def test_live_board_updates_on_leave(self):
+        bot.games[-1]['message_id'] = 100
+        bot.games[-1]['status_ids'] = [101]
+        with patch.object(bot, 'api') as api:
+            bot.on_callback({'id': 'q', 'data': 'leave:testnonce', 'from': {'id': 3}})
+        edits = [c for c in api.call_args_list if c.args[0] == 'editMessageText']
+        self.assertEqual(len(edits), 2)
+        self.assertTrue(all('Игроки (5)' in c.kwargs['text'] for c in edits))
+
+    def test_legacy_dealt_game_loads_as_playing(self):
+        bot.games[-1]['stage'] = 'done'
+        bot.save()
+        bot.load()
+        self.assertEqual(bot.games[-1]['stage'], 'playing')
 
 
 if __name__ == '__main__':
