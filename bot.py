@@ -118,6 +118,40 @@ def controls(game):
     return {"inline_keyboard": [[{"text": "🚀 Раздать роли", "callback_data": f"begin:{game['nonce']}"}], [{"text": "Отменить игру", "callback_data": f"stop:{game['nonce']}"}]]}
 
 
+def host_keyboard(game):
+    n = game['nonce']
+    rows = [[{'text': '🔄 Обновить статус', 'callback_data': f'status:{n}'}]]
+    if game['stage'] == 'ready':
+        rows.insert(0, [{'text': '🚀 Раздать роли', 'callback_data': f'begin:{n}'}])
+    elif game['stage'] == 'playing':
+        rows.append([{'text': '🏁 Завершить и показать результат', 'callback_data': f'finish:{n}'}])
+    elif game['stage'] in ('count', 'word'):
+        rows.insert(0, [{'text': '⚙️ Продолжить настройку', 'url': f'https://t.me/{USERNAME}?start=setup_{n}'}])
+    if game['stage'] not in ('playing', 'finished', 'cancelled'):
+        rows.append([{'text': 'Отменить игру', 'callback_data': f'stop:{n}'}])
+    return {'inline_keyboard': rows}
+
+
+def refresh_host(gid, message_id=None):
+    game = games[gid]
+    ids = [message_id] if message_id else game.get('host_panel_ids', [])
+    for mid in ids:
+        try:
+            api('editMessageText', chat_id=game['admin'], message_id=mid,
+                text=lobby_text(game), reply_markup=host_keyboard(game))
+        except RuntimeError as exc:
+            if 'message is not modified' not in str(exc):
+                logging.warning('Host panel refresh: %s', exc)
+
+
+def publish_host_status(gid):
+    game = games[gid]
+    message = send(game['admin'], lobby_text(game), reply_markup=host_keyboard(game))
+    if isinstance(message, dict) and message.get('message_id'):
+        game['host_panel_ids'] = (game.get('host_panel_ids', []) + [message['message_id']])[-3:]
+        save()
+
+
 def ask_count(uid):
     game = games[pending[uid]]
     send(uid, "Шаг 1 из 2. Сколько будет импостеров?\nВыбери кнопку или отправь число от 1 до 20.", reply_markup={"inline_keyboard": [[{"text": str(n), "callback_data": f"count:{game['nonce']}:{n}"} for n in (1, 2, 3)]]})
@@ -134,6 +168,8 @@ def refresh(group_id, message_id=None):
         except RuntimeError as exc:
             if "message is not modified" not in str(exc):
                 logging.warning("Lobby refresh: %s", exc)
+    if message_id is None:
+        refresh_host(group_id)
 
 
 def publish_status(gid):
@@ -235,7 +271,7 @@ def on_message(msg):
                         send(cid, 'Настраивает игру её создатель. Для участия нажми «Участвую» в группе.')
                         return
                     if game['stage'] in ('playing', 'finished'):
-                        send(cid, 'Роли уже отправлены. Создать следующую игру можно в группе.')
+                        publish_host_status(gid)
                         return
                     pending[uid] = gid
                     if game['stage'] == 'count':
@@ -243,13 +279,13 @@ def on_message(msg):
                     elif game['stage'] == 'word':
                         send(cid, 'Шаг 2 из 2. Отправь секретное слово или короткую фразу. Слово увидят только обычные игроки.')
                     else:
-                        send(cid, 'Всё готово! Когда игроки соберутся, нажми кнопку ниже.', reply_markup=controls(game))
+                        publish_host_status(gid)
                     return
                 if game['stage'] in ('playing', 'finished') or 'imposters' in game:
                     send(cid, 'Раздача уже началась. Присоединяйся к следующей игре.')
                     return
                 if uid == game['admin']:
-                    send(cid, 'Ты ведущий и знаешь слово. Собери остальных игроков, затем раздай роли.', reply_markup=controls(game))
+                    publish_host_status(gid)
                     return
                 if uid not in game['players'] and len(game['players']) >= 50:
                     send(cid, 'Уже набралось 50 игроков. Присоединяйся в следующем раунде.')
@@ -263,6 +299,9 @@ def on_message(msg):
             if gid in games and games[gid]['stage'] == 'count':
                 ask_count(uid)
                 return
+            if gid in games and games[gid]['admin'] == uid:
+                publish_host_status(gid)
+                return
             send(cid, '🎭 Привет! Добавь меня в группу, затем нажми «Новая игра». Стать ведущим может любой участник. Чтобы играть, нажми «Участвую» в группе.', reply_markup={'inline_keyboard': [[{'text': '➕ Добавить в группу', 'url': f'https://t.me/{USERNAME}?startgroup=game'}]]})
             return
         gid = pending.get(uid)
@@ -274,6 +313,9 @@ def on_message(msg):
             return
         if not game or game['admin'] != uid:
             send(cid, 'Чтобы играть, нажми «Участвую» в группе. Чтобы стать ведущим, создай там новую игру: /newgame')
+            return
+        if command in ('/status', '/players', '/results'):
+            publish_host_status(gid)
             return
         if command == '/begin':
             begin(gid, uid)
@@ -297,9 +339,9 @@ def on_message(msg):
             game['stage'] = 'ready'
             save()
             refresh(gid)
-            send(cid, f"✅ Готово! Импостеров: {game['count']}. Игроков сейчас: {len(game['players'])}.\nКогда все подключатся, нажми «Раздать роли».", reply_markup=controls(game))
+            publish_host_status(gid)
         elif game['stage'] == 'ready':
-            send(cid, 'Игра настроена. Ждём игроков!', reply_markup=controls(game))
+            publish_host_status(gid)
         else:
             send(cid, 'Роли уже отправлены. Следующую игру можно создать в группе.')
         return
@@ -380,6 +422,9 @@ def on_callback(query):
         api('answerCallbackQuery', callback_query_id=query['id'], text='Этой игрой управляет её создатель.', show_alert=True)
         return
     api('answerCallbackQuery', callback_query_id=query['id'])
+    if uid == game['admin'] and chat.get('type') == 'private' and chat.get('id') == uid and msg.get('message_id') and action in ('status', 'begin', 'finish', 'stop'):
+        game['host_panel_ids'] = list(dict.fromkeys(game.get('host_panel_ids', []) + [msg['message_id']]))[-3:]
+        refresh_host(gid, msg['message_id'])
     if action == 'count' and game['stage'] == 'count' and len(parts) == 3:
         pending[uid] = gid
         on_message({'chat': {'id': uid, 'type': 'private'}, 'from': user, 'text': parts[2]})

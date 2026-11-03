@@ -137,6 +137,39 @@ class GameTests(unittest.TestCase):
         bot.load()
         self.assertEqual(bot.games[-1]['stage'], 'playing')
 
+    def test_host_private_panel_updates_on_join_and_after_restart(self):
+        with patch.object(bot, 'send', return_value={'message_id': 200}):
+            bot.on_message({'chat': {'id': 99, 'type': 'private'}, 'from': {'id': 99}, 'text': '/status'})
+        bot.save()
+        bot.load()
+        self.assertEqual(bot.games[-1]['host_panel_ids'], [200])
+        with patch.object(bot, 'api') as api, patch.object(bot, 'send'):
+            bot.on_message({'chat': {'id': 7, 'type': 'private'}, 'from': {'id': 7, 'first_name': 'Новый игрок'}, 'text': '/start join_testnonce'})
+        edits = [c for c in api.call_args_list if c.args[0] == 'editMessageText' and c.kwargs['chat_id'] == 99]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0].kwargs['message_id'], 200)
+        self.assertIn('Игроки (7)', edits[0].kwargs['text'])
+        self.assertIn('Новый игрок', edits[0].kwargs['text'])
+        self.assertNotIn('такси', edits[0].kwargs['text'])
+
+    def test_private_refresh_button_adopts_existing_panel(self):
+        with patch.object(bot, 'api') as api:
+            bot.on_callback({'id': 'q', 'data': 'status:testnonce', 'from': {'id': 99}, 'message': {'message_id': 201, 'chat': {'id': 99, 'type': 'private'}}})
+        self.assertIn(201, bot.games[-1]['host_panel_ids'])
+        self.assertTrue(any(c.args[0] == 'editMessageText' and c.kwargs['chat_id'] == 99 for c in api.call_args_list))
+
+    def test_host_panel_controls_follow_game_stage(self):
+        game = bot.games[-1]
+        game['host_panel_ids'] = [200]
+        game.update(stage='playing', imposters={1, 2}, delivered=set(range(1, 7)))
+        with patch.object(bot, 'api') as api:
+            bot.refresh(-1)
+        edit = api.call_args
+        buttons = [b['callback_data'] for row in edit.kwargs['reply_markup']['inline_keyboard'] for b in row]
+        self.assertIn('finish:testnonce', buttons)
+        self.assertNotIn('begin:testnonce', buttons)
+        self.assertIn('Игра идёт', edit.kwargs['text'])
+
 
 if __name__ == '__main__':
     unittest.main()
