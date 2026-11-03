@@ -10,7 +10,7 @@ class GameTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
         self.addCleanup(self.tmp.cleanup)
         bot.STATE = Path(self.tmp.name) / 'state.json'
-        bot.games = {-1: {'admin': 99, 'players': {i: {'id': i, 'first_name': str(i)} for i in range(1, 7)}, 'count': 2, 'word': 'такси', 'stage': 'ready'}}
+        bot.games = {-1: {'admin': 99, 'nonce': 'testnonce', 'players': {i: {'id': i, 'first_name': str(i)} for i in range(1, 7)}, 'count': 2, 'word': 'такси', 'stage': 'ready'}}
         bot.pending = {99: -1}
         bot.offset = 123
 
@@ -55,7 +55,7 @@ class GameTests(unittest.TestCase):
         def send(cid, text, **kw):
             messages.append((cid, text, kw))
             return {'message_id': len(messages)}
-        with patch.object(bot, 'send', side_effect=send), patch.object(bot, 'is_admin', return_value=True), patch.object(bot, 'refresh'):
+        with patch.object(bot, 'send', side_effect=send), patch.object(bot, 'refresh'):
             bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': host, 'text': '/newgame'})
             nonce = bot.games[-1]['nonce']
             bot.on_message({'chat': {'id': 99, 'type': 'private'}, 'from': host, 'text': '/start setup_' + nonce})
@@ -66,11 +66,40 @@ class GameTests(unittest.TestCase):
         self.assertIn(1, bot.games[-1]['players'])
         self.assertFalse(any('такси' in text for cid, text, kw in messages if cid == -1))
 
-    def test_non_admin_cannot_create_game(self):
+    def test_any_member_can_create_game(self):
         bot.games = {}
-        with patch.object(bot, 'send'), patch.object(bot, 'is_admin', return_value=False):
+        with patch.object(bot, 'send', return_value={'message_id': 1}):
             bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 1}, 'text': '/newgame'})
-        self.assertFalse(bot.games)
+        self.assertEqual(bot.games[-1]['admin'], 1)
+
+    def test_only_creator_can_start_or_stop(self):
+        with patch.object(bot, 'send'), patch.object(bot, 'start_game') as start:
+            for cmd in ('/begin', '/stop'):
+                bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 2}, 'text': cmd})
+            start.assert_not_called()
+            self.assertIn(-1, bot.games)
+            bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 99}, 'text': '/begin'})
+            start.assert_called_once_with(-1)
+
+    def test_callback_owner_check_and_old_buttons(self):
+        with patch.object(bot, 'api') as api, patch.object(bot, 'start_game') as start:
+            bot.on_callback({'id': 'q', 'data': 'begin:testnonce', 'from': {'id': 2}})
+            self.assertTrue(api.call_args.kwargs['show_alert'])
+            start.assert_not_called()
+            bot.on_callback({'id': 'q', 'data': 'count:oldnonce:3', 'from': {'id': 99}})
+            self.assertEqual(bot.games[-1]['count'], 2)
+            bot.on_callback({'id': 'q', 'data': 'begin:testnonce', 'from': {'id': 99}})
+            start.assert_called_once_with(-1)
+
+    def test_group_start_shows_new_game_button(self):
+        with patch.object(bot, 'send') as send:
+            bot.on_message({'chat': {'id': -1, 'type': 'group'}, 'from': {'id': 1}, 'text': '/start'})
+        self.assertEqual(send.call_args.kwargs['reply_markup']['inline_keyboard'][0][0]['callback_data'], 'newgame')
+
+    def test_creator_cannot_join_as_player(self):
+        with patch.object(bot, 'send'):
+            bot.on_message({'chat': {'id': 99, 'type': 'private'}, 'from': {'id': 99}, 'text': '/start join_testnonce'})
+        self.assertNotIn(99, bot.games[-1]['players'])
 
 
 if __name__ == '__main__':

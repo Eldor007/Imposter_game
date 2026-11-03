@@ -73,15 +73,30 @@ def name(user):
 def lobby_text(game):
     players = list(game["players"].values())
     names = ", ".join(name(p) for p in players) or "пока никого"
-    return f"🎭 Импостер — набор игроков\nУчаствуют ({len(players)}): {names}\nНажмите кнопку ниже, затем откройте личный чат с ботом и нажмите Start."
+    status = "✅ Слово задано. Можно раздавать роли." if game['stage'] == 'ready' else "⚙️ Ведущий настраивает игру в личке."
+    return f"🎭 ИМПОСТЕР\nВедущий: {game.get('host_name', 'создатель игры')}\n{status}\n\nИгроки ({len(players)}): {names}\n\nНажми «Участвую», затем Start в личке. Ведущий знает слово и не участвует в раздаче."
 
 
 def keyboard(game):
-    return {"inline_keyboard": [[{"text": "🎮 Участвую / открыть бота", "url": f"https://t.me/{USERNAME}?start=join_{game['nonce']}"}], [{"text": "Выйти", "callback_data": "leave"}]]}
+    n = game['nonce']
+    rows = [[{"text": "🎮 Участвую", "url": f"https://t.me/{USERNAME}?start=join_{n}"}], [{"text": "⚙️ Настроить игру", "url": f"https://t.me/{USERNAME}?start=setup_{n}"}]]
+    if game['stage'] == 'ready':
+        rows.append([{"text": "🚀 Раздать роли", "callback_data": f"begin:{n}"}])
+    rows.append([{"text": "Выйти из игры", "callback_data": f"leave:{n}"}, {"text": "Отменить игру", "callback_data": f"stop:{n}"}])
+    return {"inline_keyboard": rows}
+
+
+def menu(cid):
+    send(cid, "🎭 Импостер — игра в ассоциации.\n\nЛюбой участник может создать игру и стать ведущим. Он задаёт слово в личке; остальные получают слово или роль импостера.\n\nНажми кнопку, чтобы начать.", reply_markup={"inline_keyboard": [[{"text": "🎲 Новая игра", "callback_data": "newgame"}]]})
+
+
+def controls(game):
+    return {"inline_keyboard": [[{"text": "🚀 Раздать роли", "callback_data": f"begin:{game['nonce']}"}], [{"text": "Отменить игру", "callback_data": f"stop:{game['nonce']}"}]]}
 
 
 def ask_count(uid):
-    send(uid, "Сколько импостеров? Выбери кнопку или отправь число от 1 до 20.", reply_markup={"inline_keyboard": [[{"text": str(n), "callback_data": f"count:{n}"} for n in (1, 2, 3)]]})
+    game = games[pending[uid]]
+    send(uid, "Шаг 1 из 2. Сколько будет импостеров?\nВыбери кнопку или отправь число от 1 до 20.", reply_markup={"inline_keyboard": [[{"text": str(n), "callback_data": f"count:{game['nonce']}:{n}"} for n in (1, 2, 3)]]})
 
 
 def refresh(group_id):
@@ -93,8 +108,13 @@ def refresh(group_id):
             logging.warning("Lobby refresh: %s", exc)
 
 
-def is_admin(group_id, user_id):
-    return any(m["user"]["id"] == user_id for m in api("getChatAdministrators", chat_id=group_id))
+def stop_game(gid):
+    game = games.pop(gid)
+    if pending.get(game['admin']) == gid:
+        pending.pop(game['admin'])
+    save()
+    send(gid, "Игра завершена.")
+    menu(gid)
 
 
 def start_game(group_id):
@@ -102,7 +122,7 @@ def start_game(group_id):
     players = list(game["players"].values())
     count = game["count"]
     if len(players) < count + 1:
-        send(game["admin"], f"Нужно минимум {count + 1} игроков; сейчас {len(players)}. Добавьте игроков и отправьте /begin снова.")
+        send(group_id, f"Пока мало игроков: {len(players)}. Для {count} импостеров нужно минимум {count + 1} игроков. Нажимайте «Участвую» в сообщении выше.", reply_markup=controls(game))
         return
     if "imposters" not in game:
         game["imposters"] = {p["id"] for p in random.SystemRandom().sample(players, count)}
@@ -125,143 +145,181 @@ def start_game(group_id):
             logging.warning("DM failed for user %s: %s", player["id"], exc)
             failed.append(player)
     if failed:
-        send(group_id, "Не смог отправить роль: " + ", ".join(name(p) for p in failed) + ". Пусть они нажмут Start в личке с ботом; админ может запустить /begin повторно. Уже доставленные роли не меняются.")
+        send(group_id, "Не смог отправить роль: " + ", ".join(name(p) for p in failed) + ". Откройте личку с ботом и нажмите Start. Затем ведущий нажимает «Раздать роли» ещё раз; назначенные роли сохранятся.", reply_markup=controls(game))
         return
     game["stage"] = "done"
     save()
-    send(group_id, f"✅ Роли отправлены {len(game['delivered'])} игрокам. Импостеров: {count}. Можно начинать! Следующая игра: /newgame")
+    send(group_id, f"✅ Роли отправлены {len(game['delivered'])} игрокам. Импостеров: {count}.\n\nПо очереди называйте ассоциации. Импостеры пытаются не выдать себя. Затем обсудите, кто подозрителен!", reply_markup={"inline_keyboard": [[{"text": "🎲 Следующая игра", "callback_data": "newgame"}]]})
 
 
 def on_message(msg):
-    chat = msg["chat"]
-    user = msg.get("from")
-    if not user or user.get("is_bot"):
+    chat = msg['chat']
+    user = msg.get('from')
+    if not user or user.get('is_bot'):
         return
-    uid, cid = user["id"], chat["id"]
-    text = (msg.get("text") or "").strip()
-    command = text.split(maxsplit=1)[0].split("@")[0].lower() if text.startswith("/") else ""
-    if command and "@" in text.split(maxsplit=1)[0]:
-        if text.split(maxsplit=1)[0].split("@", 1)[1].lower() != USERNAME.lower():
+    uid, cid = user['id'], chat['id']
+    text = (msg.get('text') or '').strip()
+    command = text.split(maxsplit=1)[0].split('@')[0].lower() if text.startswith('/') else ''
+    if command and '@' in text.split(maxsplit=1)[0]:
+        if text.split(maxsplit=1)[0].split('@', 1)[1].lower() != USERNAME.lower():
             return
-    if chat["type"] == "private":
-        if command == "/start":
-            arg = text.partition(" ")[2]
-            if arg.startswith(("join_", "setup_")):
-                kind, nonce = arg.split("_", 1)
-                match = next(((gid, g) for gid, g in games.items() if g["nonce"] == nonce), None)
+    if chat['type'] == 'private':
+        if command in ('/start', '/help'):
+            arg = text.partition(' ')[2]
+            if arg.startswith(('join_', 'setup_')):
+                kind, nonce = arg.split('_', 1)
+                match = next(((gid, g) for gid, g in games.items() if g['nonce'] == nonce), None)
                 if not match:
-                    send(cid, "Эта игра уже недоступна. Открой новую ссылку из группы.")
+                    send(cid, 'Эта игра уже завершена. Нажми кнопку в новой игре в группе.')
                     return
                 gid, game = match
-                if kind == "setup":
-                    if uid != game["admin"] or not is_admin(gid, uid):
-                        send(cid, "Настройка доступна создателю игры — админу группы.")
+                if kind == 'setup':
+                    if uid != game['admin']:
+                        send(cid, 'Настраивает игру её создатель. Для участия нажми «Участвую» в группе.')
+                        return
+                    if game['stage'] == 'done':
+                        send(cid, 'Роли уже отправлены. Создать следующую игру можно в группе.')
+                        return
+                    pending[uid] = gid
+                    if game['stage'] == 'count':
+                        ask_count(uid)
+                    elif game['stage'] == 'word':
+                        send(cid, 'Шаг 2 из 2. Отправь секретное слово или короткую фразу. Слово увидят только обычные игроки.')
                     else:
-                        pending[uid] = gid
-                        if game["stage"] == "count":
-                            ask_count(uid)
-                        elif game["stage"] == "word":
-                            send(uid, "Отправь секретное слово.")
-                        else:
-                            send(uid, "Настройка завершена. Для раздачи: /begin")
+                        send(cid, 'Всё готово! Когда игроки соберутся, нажми кнопку ниже.', reply_markup=controls(game))
                     return
-                if game["stage"] == "done" or "imposters" in game:
-                    send(cid, "Раздача уже началась. Вступить можно в следующую игру.")
+                if game['stage'] == 'done' or 'imposters' in game:
+                    send(cid, 'Раздача уже началась. Присоединяйся к следующей игре.')
                     return
-                if uid not in game["players"] and len(game["players"]) >= 50:
-                    send(cid, "Лимит — 50 игроков.")
+                if uid == game['admin']:
+                    send(cid, 'Ты ведущий и знаешь слово. Собери остальных игроков, затем раздай роли.', reply_markup=controls(game))
                     return
-                game["players"][uid] = user
-                send(cid, "✅ Ты участвуешь! Здесь придёт твоя роль после запуска админом.")
+                if uid not in game['players'] and len(game['players']) >= 50:
+                    send(cid, 'Уже набралось 50 игроков. Присоединяйся в следующем раунде.')
+                    return
+                game['players'][uid] = user
+                save()
+                send(cid, '✅ Ты в игре! Вернись в группу. Я пришлю сюда роль, когда ведущий начнёт раздачу.')
                 refresh(gid)
                 return
-            send(cid, "🎭 Импостер. Нажми «Участвую» в группе, чтобы получить роль. Админ создаёт игру командой /newgame.", reply_markup={"inline_keyboard": [[{"text": "Добавить в группу", "url": f"https://t.me/{USERNAME}?startgroup=game"}]]})
-            return
-        if command == "/cancel":
-            gid = pending.pop(uid, None)
-            if gid in games:
-                del games[gid]
-            send(cid, "Настройка отменена.")
-            return
-        group_id = pending.get(uid)
-        game = games.get(group_id) if group_id is not None else None
-        if not game or game["admin"] != uid:
-            send(cid, "Добавь меня в группу и запусти там /newgame. Перед этим нажми /start здесь.")
-            return
-        if game["stage"] == "count":
-            if not text.isdecimal() or not 1 <= int(text) <= 20:
-                send(cid, "Сколько импостеров? Отправь число от 1 до 20.")
+            gid = pending.get(uid)
+            if gid in games and games[gid]['stage'] == 'count':
+                ask_count(uid)
                 return
-            game["count"] = int(text)
-            game["stage"] = "word"
-            send(cid, "Теперь отправь секретное слово или короткую фразу.")
-        elif game["stage"] == "word":
-            if not text or text.startswith("/") or len(text) > 100:
-                send(cid, "Отправь слово или фразу до 100 символов.")
+            send(cid, '🎭 Привет! Добавь меня в группу, затем нажми «Новая игра». Стать ведущим может любой участник. Чтобы играть, нажми «Участвую» в группе.', reply_markup={'inline_keyboard': [[{'text': '➕ Добавить в группу', 'url': f'https://t.me/{USERNAME}?startgroup=game'}]]})
+            return
+        gid = pending.get(uid)
+        game = games.get(gid)
+        if command in ('/cancel', '/stop'):
+            if game and game['admin'] == uid:
+                stop_game(gid)
+            send(cid, 'Готово. Новую игру можно создать в группе.')
+            return
+        if not game or game['admin'] != uid:
+            send(cid, 'Чтобы играть, нажми «Участвую» в группе. Чтобы стать ведущим, создай там новую игру: /newgame')
+            return
+        if command == '/begin':
+            begin(gid, uid)
+            return
+        if command:
+            send(cid, 'Следуй шагам настройки или отправь /cancel для отмены.')
+            return
+        if game['stage'] == 'count':
+            if not text.isdecimal() or len(text) > 2 or not 1 <= int(text) <= 20:
+                ask_count(uid)
                 return
-            game["word"] = text
-            game["stage"] = "ready"
-            send(cid, f"Готово. Игроков сейчас: {len(game['players'])}. Когда все вступят, отправь /begin здесь или в группе.")
-        elif command == "/begin" and game["stage"] == "ready":
-            if is_admin(group_id, uid):
-                start_game(group_id)
-            else:
-                send(uid, "Запускать игру может админ группы.")
+            game['count'] = int(text)
+            game['stage'] = 'word'
+            send(cid, 'Шаг 2 из 2. Отправь секретное слово или короткую фразу (до 100 символов).')
+        elif game['stage'] == 'word':
+            if not text or len(text) > 100:
+                send(cid, 'Нужно слово или фраза до 100 символов.')
+                return
+            game['word'] = text
+            game['stage'] = 'ready'
+            save()
+            refresh(gid)
+            send(cid, f"✅ Готово! Импостеров: {game['count']}. Игроков сейчас: {len(game['players'])}.\nКогда все подключатся, нажми «Раздать роли».", reply_markup=controls(game))
+        elif game['stage'] == 'ready':
+            send(cid, 'Игра настроена. Ждём игроков!', reply_markup=controls(game))
         else:
-            send(cid, "Игра готова. Отправь /begin, когда все игроки вступят.")
+            send(cid, 'Роли уже отправлены. Следующую игру можно создать в группе.')
         return
-    if chat["type"] not in ("group", "supergroup"):
+    if chat['type'] not in ('group', 'supergroup'):
         return
-    if command == "/newgame":
-        if not is_admin(cid, uid):
-            send(cid, "Новую игру может создать только админ группы.")
+    if command in ('/start', '/help') or any(u.get('username', '').lower() == USERNAME.lower() for u in msg.get('new_chat_members', [])):
+        menu(cid)
+    elif command == '/newgame':
+        if cid in games and games[cid]['stage'] != 'done':
+            send(cid, 'Здесь уже собирается игра. Нажми «Участвую» выше. Настраивать и запускать её может создатель.')
             return
-        if cid in games and games[cid]["stage"] not in ("done",):
-            send(cid, "Сначала заверши текущую игру командой /stop.")
+        if uid in pending and pending[uid] != cid and pending[uid] in games and games[pending[uid]]['stage'] != 'done':
+            send(cid, 'Ты уже ведущий в другой группе. Сначала заверши ту игру или отправь /cancel в личке.')
             return
-        if uid in pending and pending[uid] != cid and pending[uid] in games and games[pending[uid]]["stage"] != "done":
-            send(cid, "Сначала заверши настройку игры в другой группе или отправь /cancel в личке.")
-            return
-        game = {"admin": uid, "players": {}, "stage": "count", "count": None, "word": None, "nonce": secrets.token_urlsafe(12)}
+        game = {'admin': uid, 'host_name': name(user), 'players': {}, 'stage': 'count', 'count': None, 'word': None, 'nonce': secrets.token_urlsafe(12)}
         games[cid] = game
         pending[uid] = cid
-        game["message_id"] = send(cid, lobby_text(game), reply_markup=keyboard(game))["message_id"]
-        send(cid, "Админ, задай число импостеров и слово в личке:", reply_markup={"inline_keyboard": [[{"text": "⚙️ Настроить игру", "url": f"https://t.me/{USERNAME}?start=setup_{game['nonce']}"}]]})
-    elif command == "/begin" and cid in games:
-        game = games[cid]
-        if uid != game["admin"] and not is_admin(cid, uid):
-            return
-        if game["stage"] != "ready":
-            send(cid, "Сначала админ должен задать число импостеров и слово в личке с ботом.")
+        game['message_id'] = send(cid, lobby_text(game), reply_markup=keyboard(game))['message_id']
+        save()
+    elif command == '/begin':
+        begin(cid, uid)
+    elif command == '/stop':
+        game = games.get(cid)
+        if game and uid == game['admin']:
+            stop_game(cid)
+        elif game:
+            send(cid, 'Завершить игру может её создатель.')
         else:
-            start_game(cid)
-    elif command == "/stop" and cid in games:
-        game = games[cid]
-        if uid == game["admin"] or is_admin(cid, uid):
-            pending.pop(game["admin"], None)
-            del games[cid]
-            send(cid, "Игра отменена. Для новой игры: /newgame")
+            menu(cid)
+
+
+def begin(gid, uid):
+    game = games.get(gid)
+    if not game:
+        return
+    if uid != game['admin']:
+        send(gid, 'Раздать роли может только создатель этой игры.')
+    elif game['stage'] == 'ready':
+        start_game(gid)
+    elif game['stage'] == 'done':
+        send(gid, 'Роли уже отправлены. Можно играть!')
+    else:
+        send(gid, 'Сначала ведущий задаёт число импостеров и слово. Нажми «Настроить игру» в сообщении выше.')
 
 
 def on_callback(query):
-    api("answerCallbackQuery", callback_query_id=query["id"])
-    if query.get("data", "").startswith("count:"):
-        uid = query["from"]["id"]
-        game = games.get(pending.get(uid))
-        if game and game["stage"] == "count":
-            on_message({"chat": {"id": uid, "type": "private"}, "from": query["from"], "text": query["data"].split(":")[1]})
+    data = query.get('data', '')
+    user = query['from']
+    uid = user['id']
+    msg = query.get('message') or {}
+    chat = msg.get('chat') or {}
+    if data == 'newgame':
+        api('answerCallbackQuery', callback_query_id=query['id'])
+        if chat.get('type') in ('group', 'supergroup'):
+            on_message({'chat': chat, 'from': user, 'text': '/newgame'})
         return
-    msg = query.get("message") or {}
-    group_id = (msg.get("chat") or {}).get("id")
-    game = games.get(group_id)
-    if not game or game["stage"] == "done" or "imposters" in game or msg.get("message_id") != game.get("message_id"):
+    parts = data.split(':')
+    match = next(((gid, g) for gid, g in games.items() if len(parts) > 1 and g['nonce'] == parts[1]), None)
+    if not match:
+        api('answerCallbackQuery', callback_query_id=query['id'], text='Кнопка от старой игры. Открой текущую игру в группе.', show_alert=True)
         return
-    user = query["from"]
-    if query.get("data") == "join":
-        game["players"][user["id"]] = user
-    elif query.get("data") == "leave":
-        game["players"].pop(user["id"], None)
-    refresh(group_id)
+    gid, game = match
+    action = parts[0]
+    if action in ('count', 'begin', 'stop') and uid != game['admin']:
+        api('answerCallbackQuery', callback_query_id=query['id'], text='Этой игрой управляет её создатель.', show_alert=True)
+        return
+    api('answerCallbackQuery', callback_query_id=query['id'])
+    if action == 'count' and game['stage'] == 'count' and len(parts) == 3:
+        pending[uid] = gid
+        on_message({'chat': {'id': uid, 'type': 'private'}, 'from': user, 'text': parts[2]})
+    elif action == 'begin':
+        begin(gid, uid)
+    elif action == 'stop':
+        stop_game(gid)
+    elif action == 'leave' and game['stage'] != 'done' and 'imposters' not in game:
+        game['players'].pop(uid, None)
+        refresh(gid)
+    save()
 
 
 def main():
@@ -274,7 +332,7 @@ def main():
     webhook = api("getWebhookInfo")
     if webhook.get("url"):
         raise SystemExit("This token has an active webhook; use a new dedicated bot or remove its webhook first")
-    api("setMyCommands", commands=[{"command": c, "description": d} for c, d in [("newgame", "Создать игру (админ)"), ("begin", "Раздать роли (админ)"), ("stop", "Завершить игру (админ)"), ("start", "Открыть бота"), ("cancel", "Отменить настройку в личке")]])
+    api("setMyCommands", commands=[{"command": c, "description": d} for c, d in [("newgame", "Создать игру — стать ведущим"), ("begin", "Раздать роли (ведущий)"), ("stop", "Завершить игру (ведущий)"), ("start", "Открыть бота"), ("cancel", "Отменить настройку в личке")]])
     logging.info("Bot started")
     while True:
         try:
